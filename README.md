@@ -97,6 +97,7 @@ eqtune limiter on | off               # toggle the soft limiter (default on)
 eqtune lowpower on | off              # auto-off in macOS Low Power Mode (default on)
 eqtune idle on | off                  # auto-off while no media is active (default on)
 eqtune reset [preset]                 # restore all shipped presets, or one preset
+eqtune discard                        # drop unsaved tuning changes, EQ keeps running
 eqtune completions bash|zsh|fish      # print a shell completion script
 eqtune install | uninstall            # manage the launchd daemon
 ```

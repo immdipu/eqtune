@@ -90,6 +90,8 @@ enum Command {
     Idle { state: Toggle },
     /// Reset all settings, or one shipped preset by name.
     Reset { name: Option<String> },
+    /// Discard unsaved tuning changes while the EQ keeps running.
+    Discard,
     /// Run the audio daemon in the foreground (used by the LaunchAgent).
     #[command(hide = true)]
     Daemon,
@@ -234,6 +236,7 @@ fn to_request(cmd: &Command) -> anyhow::Result<Request> {
         Command::Idle { state } => Request::SetAutoOffIdle(matches!(state, Toggle::On)),
         Command::Reset { name: Some(name) } => Request::ResetPreset { name: name.clone() },
         Command::Reset { name: None } => Request::Reset,
+        Command::Discard => Request::DiscardSession,
         Command::Daemon | Command::Install | Command::Uninstall | Command::Completions { .. } => {
             unreachable!("handled above")
         }
@@ -308,6 +311,10 @@ fn print_response(cmd: &Command, resp: &Response) {
                 }
                 Command::Reset { name: Some(name) } => {
                     println!("reset preset → {name}");
+                    None
+                }
+                Command::Discard => {
+                    println!("discarded tuning changes");
                     None
                 }
                 _ => None,
@@ -969,6 +976,15 @@ mod tests {
             Command::PresetRm { names } => assert_eq!(names, ["daily", "desk"]),
             _ => panic!("expected preset-rm command"),
         }
+    }
+
+    #[test]
+    fn discard_asks_the_daemon_to_drop_the_session_without_turning_off() {
+        let cli = Cli::try_parse_from(["eqtune", "discard"]).unwrap();
+        assert!(matches!(
+            to_request(&cli.command).unwrap(),
+            Request::DiscardSession
+        ));
     }
 
     #[test]

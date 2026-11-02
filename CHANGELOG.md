@@ -33,6 +33,14 @@ generic metadata, routing-rule, or always-on telemetry subsystem.
   exposing intermediate mixes adds persistence, limiter, response, and phase-interaction
   semantics that are not justified for A/B testing alone.
 
+## [0.7.1-oomph.2] - 2026-11-02
+
+### Added
+
+- `eqtune discard` drops unsaved tuning changes while the EQ keeps running. Before, the
+  only way to discard was the `eqtune off` prompt, so a front end that wanted to keep the
+  EQ on had to restart the engine, and native audio played in between.
+
 ## [0.7.1-oomph.1] - 2026-11-02
 
 ### Changed
