@@ -3,7 +3,7 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 
@@ -41,6 +41,10 @@ unsafe extern "C" {
     ) -> *mut RawSession;
     fn eqtune_tap_runtime_error(session: *mut RawSession) -> u32;
     fn eqtune_tap_stop(session: *mut RawSession);
+    fn eqtune_output_mute(dev: u32) -> std::ffi::c_int;
+    fn eqtune_set_output_mute(dev: u32, mute: bool) -> bool;
+    fn eqtune_device_with_uid(uid: *const c_char) -> u32;
+    fn eqtune_watch_default_output(fd: std::ffi::c_int) -> bool;
 }
 
 /// Restore the default `SIGPIPE` disposition, so the process dies quietly — like any
@@ -268,9 +272,44 @@ pub fn default_output_device_running() -> bool {
     unsafe { eqtune_default_output_device_running() }
 }
 
+/// Have Core Audio write a byte to `fd` whenever the default output device changes, and
+/// whenever an output that has been the default starts or stops running. Returns false if
+/// the default-output listener could not be installed.
+pub fn watch_default_output(fd: std::os::fd::RawFd) -> bool {
+    unsafe { eqtune_watch_default_output(fd) }
+}
+
+/// Whether output `dev` is muted by its own mute switch, or `None` when it has none eqtune
+/// can set.
+pub fn output_muted(dev: u32) -> Option<bool> {
+    match unsafe { eqtune_output_mute(dev) } {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// Flip output `dev`'s mute switch; false on failure (for example, the output is gone).
+pub fn set_output_muted(dev: u32, muted: bool) -> bool {
+    unsafe { eqtune_set_output_mute(dev, muted) }
+}
+
+/// The stable UID of output `dev`.
+pub fn output_device_uid(dev: u32) -> Option<String> {
+    output_device_string(dev, eqtune_output_device_uid)
+}
+
+/// The device whose UID is `uid`, if it is present.
+pub fn output_device_with_uid(uid: &str) -> Option<u32> {
+    let uid = std::ffi::CString::new(uid).ok()?;
+    let dev = unsafe { eqtune_device_with_uid(uid.as_ptr()) };
+    (dev != 0).then_some(dev)
+}
+
 #[derive(Default)]
 struct AudioActivity {
     silent_frames: AtomicU64,
+    played: AtomicBool,
 }
 
 /// Owned by the audio thread (via the raw pointer handed to the shim): the filter
@@ -295,6 +334,7 @@ extern "C" fn process_trampoline(ctx: *mut c_void, buffer: *mut f32, frames: u32
     // `run` scans the block for input silence once and returns it, so idle accounting
     // reuses that result instead of walking the buffer a second time here.
     let silent = state.processor.run(&settings, buf, channels as usize);
+    state.activity.played.store(true, Ordering::Relaxed);
     if silent {
         state
             .activity
@@ -323,6 +363,11 @@ impl EqHandle {
 
     pub fn silent_frames(&self) -> u64 {
         self.activity.silent_frames.load(Ordering::Relaxed)
+    }
+
+    /// Whether the engine has processed a block, so its tap is muting the apps it replays.
+    pub fn has_played(&self) -> bool {
+        self.activity.played.load(Ordering::Relaxed)
     }
 }
 

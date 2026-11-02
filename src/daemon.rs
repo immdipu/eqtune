@@ -4,7 +4,7 @@
 //! follow the system default output device (so plugging in EarPods/Bluetooth "just
 //! works" without manually re-selecting output).
 
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -38,8 +38,12 @@ const RESPONSE_FREQUENCIES: [f32; 31] = [
 /// Fallback sample rate (Hz) used only when the default output device's nominal rate is
 /// unavailable. 48 kHz is the near-universal default for macOS output devices.
 const DEFAULT_SAMPLE_RATE_HZ: u32 = 48_000;
-/// How often the idle loop accepts connections and checks the default device.
+/// How often the idle loop checks the engine and devices when no connection or
+/// default-output change wakes it sooner.
 const POLL: Duration = Duration::from_millis(100);
+/// Longest a mute guard waits for a restarted engine to play before giving up and letting
+/// audio play untuned, so a stuck start can never leave the output silent.
+const MUTE_GUARD_LIMIT: Duration = Duration::from_secs(3);
 /// Total budget for one client request/response exchange. `read_request_line` spends this
 /// down across the whole read (not just each recv), so a client that drips bytes just under
 /// the socket timeout still can't hold the single-threaded accept/poll loop open.
@@ -107,6 +111,105 @@ impl Recovery {
     fn due(&self, now: Instant) -> bool {
         self.next_retry.is_some_and(|at| now >= at)
     }
+}
+
+/// A mute guard the daemon raised on `device`. `mute` is `None` when the output was
+/// already muted by the user or has no mute switch: then there is nothing to undo.
+struct RaisedGuard {
+    device: u32,
+    mute: Option<OutputMute>,
+    raised_at: Instant,
+}
+
+/// Whether a raised mute guard stays up: until the restarted engine plays its first block,
+/// for at most `MUTE_GUARD_LIMIT`. Without a running engine it comes down at once, so a
+/// failed start plays untuned rather than silent.
+fn keeps_mute_guard(engine_waiting: bool, waited: Duration) -> bool {
+    engine_waiting && waited < MUTE_GUARD_LIMIT
+}
+
+/// An output eqtune muted with its own mute switch, like the mute key, so nothing plays
+/// untuned while the engine starts on it; dropping it unmutes the output. Its UID stays in
+/// `muted-outputs` until then, so an output left muted by a crash, or by vanishing while
+/// muted (a cable pulled mid-switch), is unmuted by `unmute_leftovers` when the daemon
+/// starts or the output comes back.
+struct OutputMute {
+    device: u32,
+    uid: String,
+}
+
+impl OutputMute {
+    /// Mute `device`, or `None` if the user already muted it.
+    fn start(device: u32) -> anyhow::Result<Option<Self>> {
+        match sys::output_muted(device) {
+            None => anyhow::bail!("output #{device} has no mute switch"),
+            Some(true) => return Ok(None),
+            Some(false) => {}
+        }
+        let uid = sys::output_device_uid(device)
+            .with_context(|| format!("could not read output #{device}'s UID"))?;
+        update_muted_outputs(|uids| uids.push(uid.clone()))?;
+        if !sys::set_output_muted(device, true) {
+            let _ = update_muted_outputs(|uids| uids.retain(|u| *u != uid));
+            anyhow::bail!("could not mute output #{device}");
+        }
+        Ok(Some(Self { device, uid }))
+    }
+}
+
+impl Drop for OutputMute {
+    fn drop(&mut self) {
+        if sys::set_output_muted(self.device, false) {
+            let _ = update_muted_outputs(|uids| uids.retain(|u| *u != self.uid));
+        }
+    }
+}
+
+/// Unmute every output an earlier guard muted and couldn't unmute, if it is present now.
+fn unmute_leftovers() {
+    let _ = update_muted_outputs(|uids| {
+        uids.retain(|uid| {
+            !sys::output_device_with_uid(uid).is_some_and(|dev| sys::set_output_muted(dev, false))
+        })
+    });
+}
+
+fn update_muted_outputs(change: impl FnOnce(&mut Vec<String>)) -> std::io::Result<()> {
+    update_uid_list(&ipc::socket_path().with_file_name("muted-outputs"), change)
+}
+
+/// Apply `change` to the UIDs listed one per line in `path`, removing the file once empty.
+fn update_uid_list(path: &Path, change: impl FnOnce(&mut Vec<String>)) -> std::io::Result<()> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut uids: Vec<String> = text.lines().map(str::to_owned).collect();
+    change(&mut uids);
+    if !uids.is_empty() {
+        return std::fs::write(path, uids.join("\n") + "\n");
+    }
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Wait until a client connects, Core Audio reports an output change (`wake` is readable),
+/// or `timeout` passes, then drain `wake`.
+fn wait_for_activity(listener: &UnixListener, mut wake: &UnixStream, timeout: Duration) {
+    let mut fds = [listener.as_raw_fd(), wake.as_raw_fd()].map(|fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    // An error (EINTR) just ends this wait early, like a timeout.
+    unsafe {
+        libc::poll(
+            fds.as_mut_ptr(),
+            fds.len() as libc::nfds_t,
+            timeout.as_millis() as i32,
+        )
+    };
+    let mut drained = [0u8; 64];
+    while matches!(wake.read(&mut drained), Ok(n) if n > 0) {}
 }
 
 /// Process-lifetime advisory lock for the daemon. The lock file intentionally remains on
@@ -255,6 +358,9 @@ pub struct Daemon {
     /// Whether the engine is currently off because captured audio was silent long enough
     /// to count as no active media.
     idle_suspended: bool,
+    /// Mutes the output while the engine restarts on it, so nothing plays untuned in
+    /// between. See `follow_mute_guard`.
+    mute_guard: Option<RaisedGuard>,
     /// A session-draft mirror write is pending: an edit changed the working config within
     /// `SESSION_MIRROR_MIN_INTERVAL` of the last write, so the write was deferred to the
     /// poll loop (`maybe_flush_draft`) to coalesce the burst. See `sync_session_file`.
@@ -298,6 +404,7 @@ impl Daemon {
             recovery: Recovery::default(),
             last_engine_error: None,
             bypassed: false,
+            mute_guard: None,
             draft_dirty: false,
             draft_last_write: None,
         })
@@ -313,6 +420,15 @@ impl Daemon {
         let listener = bind_control_listener(&path)?;
         listener.set_nonblocking(true)?;
         eprintln!("eqtune daemon listening on {}", path.display());
+        unmute_leftovers();
+        // Core Audio writes to `wake_tx` when the default output changes or starts playing,
+        // so a mute guard goes up within milliseconds rather than at the next poll.
+        let (wake, wake_tx) = UnixStream::pair()?;
+        wake.set_nonblocking(true)?;
+        wake_tx.set_nonblocking(true)?;
+        if !sys::watch_default_output(wake_tx.as_raw_fd()) {
+            eprintln!("could not watch the default output — following it every {POLL:?}");
+        }
 
         // Restore the last run's on state (eager path only; the idle-aware restore starts
         // suspended and lets `follow_idle_activity` start the engine on real playback). A
@@ -347,8 +463,9 @@ impl Daemon {
             self.follow_idle_activity();
             self.follow_default_device();
             self.follow_recovery();
+            self.follow_mute_guard();
             self.maybe_flush_draft(Instant::now());
-            std::thread::sleep(POLL);
+            wait_for_activity(&listener, &wake, POLL);
         }
     }
 
@@ -791,6 +908,12 @@ impl Daemon {
         if output_id != self.observed_output_id {
             self.observed_output_id = output_id;
             eprintln!("default output changed to {output_id:?} — rebuilding engine");
+            unmute_leftovers();
+            // Apps are already playing to the new output: hold them back there until the
+            // engine plays on it.
+            if self.engine_target_on {
+                self.raise_mute_guard(Instant::now());
+            }
             self.engine = None;
             self.engine_target = None;
             self.attempted_target = None;
@@ -819,6 +942,7 @@ impl Daemon {
         };
         if rate.round() as u32 != target.sample_rate.round() as u32 {
             eprintln!("output sample rate changed to {rate} Hz — rebuilding engine");
+            self.raise_mute_guard(Instant::now());
             self.engine = None;
             self.engine_target = None;
             self.recovery.reset();
@@ -926,8 +1050,58 @@ impl Daemon {
             self.engine_target_on = true;
             self.recovery.reset();
             eprintln!("default output active — eqtune resuming");
+            self.raise_mute_guard(Instant::now());
             if let Err(e) = self.reconcile() {
                 eprintln!("engine idle-resume failed: {e}");
+            }
+        }
+    }
+
+    /// Lift the mute guard once the restarted engine has played its first block (so its tap
+    /// is muting the apps it replays), at once when no engine is starting, and after
+    /// `MUTE_GUARD_LIMIT` at most.
+    fn follow_mute_guard(&mut self) {
+        let Some(guard) = &self.mute_guard else {
+            return;
+        };
+        let waiting = self.engine.as_ref().is_some_and(|(_, h)| !h.has_played());
+        let waited = guard.raised_at.elapsed();
+        if keeps_mute_guard(waiting, waited) {
+            return;
+        }
+        if guard.mute.is_some() {
+            let why = match &self.engine {
+                Some(_) if waiting => "the EQ took too long to start",
+                Some(_) => "the EQ is playing",
+                None => "the EQ is not running",
+            };
+            eprintln!("output unmuted after {} ms: {why}", waited.as_millis());
+        }
+        self.mute_guard = None;
+    }
+
+    /// Mute the default output with its own mute switch until `follow_mute_guard` lifts the
+    /// guard: apps start playing to it before the engine can, untuned and often louder.
+    fn raise_mute_guard(&mut self, now: Instant) {
+        let Some(device) = sys::default_output_device() else {
+            self.mute_guard = None;
+            return;
+        };
+        match &mut self.mute_guard {
+            // Already muted by this guard: muting again would see the output as the user's.
+            Some(guard) if guard.device == device => guard.raised_at = now,
+            _ => {
+                let mute = OutputMute::start(device)
+                    .inspect_err(|e| {
+                        eprintln!("could not mute the output while the EQ starts: {e}")
+                    })
+                    .ok()
+                    .flatten();
+                self.mute_guard = Some(RaisedGuard {
+                    device,
+                    mute,
+                    raised_at: now,
+                });
             }
         }
     }
@@ -2733,6 +2907,47 @@ mod tests {
     }
 
     #[test]
+    fn mute_guard_holds_until_the_engine_plays() {
+        let soon = Duration::from_millis(50);
+        assert!(
+            keeps_mute_guard(true, soon),
+            "restarted, nothing played yet"
+        );
+        assert!(!keeps_mute_guard(false, soon), "playing, or no engine");
+        assert!(
+            !keeps_mute_guard(true, MUTE_GUARD_LIMIT),
+            "a stuck start must not keep the output silent"
+        );
+    }
+
+    #[test]
+    fn mute_guard_comes_down_without_an_engine() {
+        // A failed start or `off`: play untuned rather than leave the output muted. A guard
+        // that muted nothing stands in, so no test mutes this Mac's audio.
+        let mut d = daemon_with(Config::default());
+        d.mute_guard = Some(RaisedGuard {
+            device: 1,
+            mute: None,
+            raised_at: Instant::now(),
+        });
+
+        d.follow_mute_guard();
+
+        assert!(d.mute_guard.is_none());
+    }
+
+    #[test]
+    fn muted_outputs_list_is_removed_once_empty() {
+        let path = tmp_path("muted-outputs");
+        update_uid_list(&path, |uids| uids.extend(["a".into(), "b".into()])).unwrap();
+        update_uid_list(&path, |uids| uids.retain(|u| u != "a")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "b\n");
+        update_uid_list(&path, |uids| uids.clear()).unwrap();
+        assert!(!path.exists());
+        update_uid_list(&path, |_| {}).unwrap();
+    }
+
+    #[test]
     fn exhausted_recovery_cannot_reconcile_an_extra_attempt() {
         let mut d = daemon_with(Config::default());
         d.user_intent = true;
@@ -2921,6 +3136,7 @@ mod tests {
             last_engine_error: None,
             bypassed: false,
             idle_suspended: false,
+            mute_guard: None,
             draft_dirty: false,
             draft_last_write: None,
         })

@@ -76,6 +76,21 @@ uint32_t eqtune_tap_runtime_error(eqtune_tap_session *session);
 // Stop and tear down a session (safe to call with NULL).
 void eqtune_tap_stop(eqtune_tap_session *session);
 
+// The master output mute of exactly `dev`: 1 muted, 0 unmuted, or -1 when it has no mute
+// switch eqtune can set.
+int eqtune_output_mute(uint32_t dev);
+
+// Sets the master output mute of exactly `dev`; false on failure.
+bool eqtune_set_output_mute(uint32_t dev, bool mute);
+
+// AudioObjectID of the device whose UID is `uid` (NUL-terminated UTF-8), or 0 if absent.
+uint32_t eqtune_device_with_uid(const char *uid);
+
+// Write a byte to `fd` whenever the default output device changes, and whenever an output
+// that has been the default starts or stops running. Returns false if the default-output
+// listener could not be installed.
+bool eqtune_watch_default_output(int fd);
+
 #ifdef __cplusplus
 }
 #endif

@@ -269,8 +269,9 @@ system audio ─▶ device-scoped process tap (excludes eqtune; muted-when-tappe
 A launchd LaunchAgent runs the daemon; a Unix-socket CLI controls it. The tap is bound to
 the exact output UID and its sole stream, so Core Audio exposes capture at that stream's
 native format. Putting that tap and output in one aggregate device gives them one clock,
-with no resampling or drift to fight. A lightweight poll makes the engine follow
-default-device changes (plug in headphones and audio follows).
+with no resampling or drift to fight. Core Audio tells the daemon when the default
+output changes, so the engine follows it (plug in headphones and audio follows), and the
+output stays muted until the EQ plays there, so nothing plays untuned in between.
 
 For a deeper dive — the daemon/CLI split, the lock-free real-time DSP, the Objective-C
 Core Audio shim, and *why* it's built this way — see [ARCHITECTURE.md](ARCHITECTURE.md).

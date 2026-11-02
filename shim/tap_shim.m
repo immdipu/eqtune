@@ -228,6 +228,119 @@ static AudioObjectID self_process_object(void) {
     return obj;
 }
 
+// --- output mute and change notices ---------------------------------------
+
+static AudioObjectPropertyAddress output_mute_address(void) {
+    return (AudioObjectPropertyAddress){
+        .mSelector = kAudioDevicePropertyMute,
+        .mScope = kAudioObjectPropertyScopeOutput,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+}
+
+int eqtune_output_mute(uint32_t dev) {
+    AudioObjectPropertyAddress addr = output_mute_address();
+    Boolean settable = false;
+    UInt32 muted = 0;
+    UInt32 size = sizeof(muted);
+    if (!AudioObjectHasProperty(dev, &addr) ||
+        AudioObjectIsPropertySettable(dev, &addr, &settable) != noErr || !settable ||
+        AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, &muted) != noErr) {
+        return -1;
+    }
+    return muted ? 1 : 0;
+}
+
+bool eqtune_set_output_mute(uint32_t dev, bool mute) {
+    AudioObjectPropertyAddress addr = output_mute_address();
+    UInt32 value = mute ? 1 : 0;
+    return AudioObjectSetPropertyData(dev, &addr, 0, NULL, sizeof(value), &value) == noErr;
+}
+
+uint32_t eqtune_device_with_uid(const char *uid) {
+    CFStringRef uid_string = CFStringCreateWithCString(NULL, uid, kCFStringEncodingUTF8);
+    if (!uid_string) {
+        return kAudioObjectUnknown;
+    }
+    AudioObjectID dev = kAudioObjectUnknown;
+    UInt32 size = sizeof(dev);
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioHardwarePropertyTranslateUIDToDevice,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    OSStatus st = AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, sizeof(uid_string),
+                                             &uid_string, &size, &dev);
+    CFRelease(uid_string);
+    return st == noErr ? dev : kAudioObjectUnknown;
+}
+
+static int wake_fd = -1;
+// Serial: listener blocks and the initial registration share `watched_outputs` on it.
+static dispatch_queue_t watch_queue;
+static NSMutableSet<NSNumber *> *watched_outputs;
+
+static void wake_daemon(void) {
+    const char wake = 1;
+    (void)write(wake_fd, &wake, 1); // a full buffer already holds a pending wake
+}
+
+// Runs on `watch_queue`. Devices are watched once; Core Audio drops a vanished device's
+// listener with it.
+static void watch_running(AudioObjectID dev) {
+    if (dev == kAudioObjectUnknown || [watched_outputs containsObject:@(dev)]) {
+        return;
+    }
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioDevicePropertyDeviceIsRunningSomewhere,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    OSStatus st = AudioObjectAddPropertyListenerBlock(
+        dev, &addr, watch_queue,
+        ^(UInt32 count, const AudioObjectPropertyAddress *addresses) {
+            (void)count; (void)addresses;
+            wake_daemon();
+        });
+    if (st == noErr) {
+        [watched_outputs addObject:@(dev)];
+    } else {
+        log_err("AudioObjectAddPropertyListenerBlock (output running)", st);
+    }
+}
+
+bool eqtune_watch_default_output(int fd) {
+    wake_fd = fd;
+    watch_queue = dispatch_queue_create("eqtune.watch", DISPATCH_QUEUE_SERIAL);
+    watched_outputs = [NSMutableSet set];
+    // Deliver HAL notifications on the HAL's own thread: the daemon runs no run loop.
+    CFRunLoopRef run_loop = NULL;
+    AudioObjectPropertyAddress loop_addr = {
+        .mSelector = kAudioHardwarePropertyRunLoop,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    AudioObjectSetPropertyData(kAudioObjectSystemObject, &loop_addr, 0, NULL,
+                               sizeof(run_loop), &run_loop);
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioHardwarePropertyDefaultOutputDevice,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    OSStatus st = AudioObjectAddPropertyListenerBlock(
+        kAudioObjectSystemObject, &addr, watch_queue,
+        ^(UInt32 count, const AudioObjectPropertyAddress *addresses) {
+            (void)count; (void)addresses;
+            watch_running(default_output_device());
+            wake_daemon();
+        });
+    if (st != noErr) {
+        log_err("AudioObjectAddPropertyListenerBlock (default output)", st);
+    }
+    dispatch_sync(watch_queue, ^{ watch_running(default_output_device()); });
+    return st == noErr;
+}
+
 // --- session ---------------------------------------------------------------
 
 struct eqtune_tap_session {

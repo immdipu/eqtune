@@ -203,9 +203,14 @@ that exact device's output streams, and accepts one mixable interleaved stereo F
 stream at any valid native rate. UID, name, nominal rate, and the selected stream format
 all come from that snapshot; its UID and stream index are passed into tap construction.
 The running target becomes authoritative only after aggregate validation and startup,
-while a complete failed target remains visible in `status` for diagnosis. The daemon
-polls every 100 ms; when you plug in headphones or switch to Bluetooth, it tears the
-aggregate down and rebuilds it around one new snapshot (`follow_default_device`).
+while a complete failed target remains visible in `status` for diagnosis. Core Audio
+tells the daemon when the default output changes (a listener wakes its loop, which
+otherwise ticks every 100 ms); when you plug in headphones or switch to Bluetooth, it tears
+the aggregate down and rebuilds it around one new snapshot (`follow_default_device`).
+Apps are already playing to the new output by then, and a rebuild takes about a second
+before the tap mutes them, so a mute guard flips that output's own mute switch until the
+rebuilt engine plays its first block. (A second tap with `CATapMuted` does not work: a tap
+nobody reads mutes nothing.)
 
 **Compatibility boundary.** The selected stream must be mixable, little-endian,
 interleaved stereo Float32. Its native sample rate is unrestricted; the device-scoped tap
@@ -320,6 +325,11 @@ be on and isn't, drop it if it should be off and is. Every event routes through 
 - `follow_idle_activity()` watches the audio thread's silent-frame counter while the
   engine is running. After two minutes of silence it drops the engine; while suspended, it
   polls Core Audio's default-output-device activity and resumes when playback starts.
+- `follow_mute_guard()` lifts the mute guard raised by an idle resume or an output change
+  once the restarted engine has played a block, at once when no engine is starting, and
+  after 3 seconds at most. An output the user muted is left alone; the UIDs of outputs the
+  guard muted are kept in `muted-outputs` until unmuted, so a crash or an output vanishing
+  mid-switch can't leave one muted.
 - `follow_default_device()` rebuilds a running engine when the target changes and also
   observes device-ID changes while the engine is down, so exhausted recovery can restart
   on a genuinely new output.

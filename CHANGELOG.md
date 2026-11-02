@@ -33,6 +33,19 @@ generic metadata, routing-rule, or always-on telemetry subsystem.
   exposing intermediate mixes adds persistence, limiter, response, and phase-interaction
   semantics that are not justified for A/B testing alone.
 
+## [0.7.1-oomph.4] - 2026-11-02
+
+### Changed
+
+- Waking from the idle pause, a new default output and a sample-rate change each played
+  apps natively — untuned, often louder — for the second the engine takes to start. The
+  daemon now mutes that output with its own mute switch until the restarted engine plays
+  its first block: at most 3 seconds, and not at all once the engine can't start. An
+  output the user muted stays muted, and one left muted by a crash, or by vanishing
+  mid-switch, is unmuted when the daemon starts or the output comes back.
+- The daemon hears from Core Audio when the default output changes or starts playing,
+  instead of noticing at its next 100 ms poll, and answers a client as soon as it connects.
+
 ## [0.7.1-oomph.2] - 2026-11-02
 
 ### Added
