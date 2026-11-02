@@ -33,6 +33,14 @@ generic metadata, routing-rule, or always-on telemetry subsystem.
   exposing intermediate mixes adds persistence, limiter, response, and phase-interaction
   semantics that are not justified for A/B testing alone.
 
+## [0.7.1-oomph.1] - 2026-11-02
+
+### Changed
+
+- Idle auto-off waits for 2 minutes of silence instead of 10 seconds. A resume plays the
+  first second or two without the EQ while the tap restarts, so the short gaps of picking
+  the next song or switching apps no longer suspend the engine.
+
 ## [0.7.1] - 2026-09-02
 
 ### Fixed

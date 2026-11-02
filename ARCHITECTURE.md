@@ -318,7 +318,7 @@ be on and isn't, drop it if it should be off and is. Every event routes through 
   engine off (a large power saving) while remembering `user_intent`; leaving LPM
   restores it. An explicit `eqtune on` overrides and runs even under LPM.
 - `follow_idle_activity()` watches the audio thread's silent-frame counter while the
-  engine is running. After sustained silence it drops the engine; while suspended, it
+  engine is running. After two minutes of silence it drops the engine; while suspended, it
   polls Core Audio's default-output-device activity and resumes when playback starts.
 - `follow_default_device()` rebuilds a running engine when the target changes and also
   observes device-ID changes while the engine is down, so exhausted recovery can restart

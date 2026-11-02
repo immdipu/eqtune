@@ -36,7 +36,7 @@ pub struct Config {
     /// files, hence the serde default.
     #[serde(default = "default_true")]
     pub auto_off_low_power: bool,
-    /// Automatically disable the EQ engine after sustained silence and resume when the
+    /// Automatically disable the EQ engine after two minutes of silence and resume when the
     /// default output device becomes active again.
     #[serde(default = "default_true")]
     pub auto_off_idle: bool,

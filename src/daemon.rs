@@ -48,8 +48,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// JSON lines; this only caps a misbehaving client so a newline-less flood can't grow the
 /// read buffer without bound.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
-/// How long captured audio must remain silent before the engine is suspended.
-const IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(10);
+/// How long captured audio must remain silent before the engine is suspended. Resuming
+/// plays the first second or two natively (without the EQ, often louder) while the tap
+/// restarts, so ordinary gaps — picking the next song, switching apps — must not suspend.
+const IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(120);
 /// Minimum spacing between session-draft mirror writes. The first edit after a quiet
 /// period is mirrored immediately (an isolated edit is never at risk of being lost); a
 /// *burst* of edits within this window is coalesced into one write flushed from the poll
